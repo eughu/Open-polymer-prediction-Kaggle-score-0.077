@@ -1,0 +1,744 @@
+import pandas as pd
+import numpy as np
+import re
+from collections import Counter, defaultdict
+import warnings
+warnings.filterwarnings('ignore')
+
+# 机器学习库
+from sklearn.ensemble import RandomForestRegressor, ExtraTreesRegressor, GradientBoostingRegressor
+from sklearn.multioutput import MultiOutputRegressor
+from sklearn.model_selection import train_test_split, KFold, cross_val_score, cross_val_predict
+from sklearn.preprocessing import StandardScaler, RobustScaler
+from sklearn.metrics import mean_absolute_error
+from sklearn.linear_model import Ridge, Lasso, ElasticNet
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.feature_selection import SelectKBest, f_regression
+
+# 数据处理
+from tqdm import tqdm
+import joblib
+
+class AdvancedSMILESFeatureExtractor:
+    """增强的SMILES特征提取器，不依赖rdkit"""
+    
+    def __init__(self):
+        # 原子量表
+        self.atomic_weights = {
+            'H': 1.008, 'C': 12.011, 'N': 14.007, 'O': 15.999, 
+            'F': 18.998, 'P': 30.974, 'S': 32.06, 'Cl': 35.45, 
+            'Br': 79.904, 'I': 126.9, 'Si': 28.085, 'B': 10.81,
+            'Al': 26.982, 'Ca': 40.078, 'Fe': 55.845, 'Mg': 24.305
+        }
+        
+        # 电负性表
+        self.electronegativity = {
+            'H': 2.20, 'C': 2.55, 'N': 3.04, 'O': 3.44, 
+            'F': 3.98, 'P': 2.19, 'S': 2.58, 'Cl': 3.16, 
+            'Br': 2.96, 'I': 2.66, 'Si': 1.90, 'B': 2.04
+        }
+        
+        # 存储拟合的TF-IDF vectorizers
+        self.char_vectorizer = None
+        self.token_vectorizer = None
+        self.is_fitted = False
+
+    def parse_smiles_advanced(self, smiles):
+        """高级SMILES解析，提取更多结构信息"""
+        try:
+            # 清理SMILES
+            smiles_clean = re.sub(r'[@/\\]', '', smiles)
+            
+            # 原子统计
+            atoms = re.findall(r'[A-Z][a-z]?', smiles_clean)
+            atom_counts = Counter(atoms)
+            
+            # 键类型统计
+            single_bonds = len(re.findall(r'-', smiles_clean))
+            double_bonds = len(re.findall(r'=', smiles_clean))
+            triple_bonds = len(re.findall(r'#', smiles_clean))
+            aromatic_bonds = len(re.findall(r'[a-z]', smiles_clean))
+            
+            # 环分析
+            ring_numbers = re.findall(r'\d', smiles_clean)
+            ring_count = len(set(ring_numbers))
+            ring_closures = len(ring_numbers)
+            
+            # 分支分析
+            open_branches = len(re.findall(r'\(', smiles_clean))
+            close_branches = len(re.findall(r'\)', smiles_clean))
+            
+            # 电荷分析
+            positive_charges = len(re.findall(r'\+', smiles_clean))
+            negative_charges = len(re.findall(r'-', smiles_clean))
+            
+            return {
+                'atoms': atom_counts,
+                'single_bonds': single_bonds,
+                'double_bonds': double_bonds,
+                'triple_bonds': triple_bonds,
+                'aromatic_bonds': aromatic_bonds,
+                'ring_count': ring_count,
+                'ring_closures': ring_closures,
+                'branches': max(open_branches, close_branches),
+                'positive_charges': positive_charges,
+                'negative_charges': negative_charges,
+                'length': len(smiles_clean)
+            }
+        except Exception as e:
+            print(f"解析SMILES失败: {e}")
+            return None
+
+    def extract_basic_features(self, smiles):
+        """提取基本分子特征"""
+        parsed = self.parse_smiles_advanced(smiles)
+        if parsed is None:
+            return {}
+        
+        features = {}
+        
+        # 原子统计
+        total_atoms = sum(parsed['atoms'].values())
+        features['total_atoms'] = total_atoms
+        features['total_heavy_atoms'] = total_atoms - parsed['atoms'].get('H', 0)
+        
+        # 各种原子数量
+        for atom in ['C', 'N', 'O', 'S', 'F', 'Cl', 'Br', 'I', 'P', 'Si']:
+            features[f'num_{atom.lower()}'] = parsed['atoms'].get(atom, 0)
+        
+        # 卤素总数
+        features['num_halogens'] = sum(parsed['atoms'].get(x, 0) for x in ['F', 'Cl', 'Br', 'I'])
+        
+        # 分子量估算
+        molecular_weight = sum(count * self.atomic_weights.get(atom, 12) 
+                              for atom, count in parsed['atoms'].items())
+        features['molecular_weight'] = molecular_weight
+        
+        # 键统计
+        features['single_bonds'] = parsed['single_bonds']
+        features['double_bonds'] = parsed['double_bonds']
+        features['triple_bonds'] = parsed['triple_bonds']
+        features['aromatic_bonds'] = parsed['aromatic_bonds']
+        total_bonds = sum([parsed['single_bonds'], parsed['double_bonds'], 
+                          parsed['triple_bonds'], parsed['aromatic_bonds']])
+        features['total_bonds'] = total_bonds
+        
+        # 不饱和度
+        features['unsaturation_index'] = (parsed['double_bonds'] + 
+                                         2 * parsed['triple_bonds'] + 
+                                         parsed['aromatic_bonds'])
+        
+        # 结构复杂度
+        features['ring_count'] = parsed['ring_count']
+        features['ring_closures'] = parsed['ring_closures']
+        features['branches'] = parsed['branches']
+        features['smiles_length'] = parsed['length']
+        
+        # 电荷特征
+        features['positive_charges'] = parsed['positive_charges']
+        features['negative_charges'] = parsed['negative_charges']
+        features['net_charge'] = parsed['positive_charges'] - parsed['negative_charges']
+        
+        # 比例特征
+        if total_atoms > 0:
+            features['carbon_ratio'] = features['num_c'] / total_atoms
+            features['heteroatom_ratio'] = (total_atoms - features['num_c']) / total_atoms
+            features['electronegative_ratio'] = (features['num_n'] + features['num_o'] + 
+                                               features['num_f']) / total_atoms
+        else:
+            features['carbon_ratio'] = 0
+            features['heteroatom_ratio'] = 0
+            features['electronegative_ratio'] = 0
+        
+        # 平均电负性
+        electronegativity_sum = sum(count * self.electronegativity.get(atom, 2.5) 
+                                   for atom, count in parsed['atoms'].items())
+        electronegativity_count = sum(parsed['atoms'].values())
+        features['avg_electronegativity'] = (electronegativity_sum / electronegativity_count 
+                                            if electronegativity_count > 0 else 0)
+        
+        return features
+
+    def extract_polymer_specific_features(self, smiles):
+        """提取聚合物特异性特征"""
+        features = {}
+        
+        # 柔性指标
+        single_bond_count = len(re.findall(r'C-C|CC(?![=\#])', smiles))
+        total_bonds = len(re.findall(r'[-=#]|[A-Za-z][A-Za-z]', smiles))
+        features['flexibility_index'] = single_bond_count / max(total_bonds, 1)
+        
+        # 刚性指标（基于环和芳香结构）
+        aromatic_count = len(re.findall(r'c', smiles))
+        ring_indicators = len(re.findall(r'[0-9]', smiles))
+        features['rigidity_index'] = (aromatic_count + ring_indicators) / max(len(smiles), 1)
+        
+        # 分支指标
+        branch_count = len(re.findall(r'[\(\)]', smiles))
+        features['branching_index'] = branch_count / max(len(smiles), 1)
+        
+        # 链长度估算
+        carbon_chain_length = self.estimate_carbon_chain_length(smiles)
+        features['carbon_chain_length'] = carbon_chain_length
+        
+        # 侧链密度
+        side_chain_indicators = len(re.findall(r'\([^)]*\)', smiles))
+        features['side_chain_density'] = side_chain_indicators / max(len(smiles), 1)
+        
+        # 玻璃化转变相关特征
+        features['tg_aromatic_indicator'] = len(re.findall(r'c1ccccc1', smiles))
+        features['tg_rigid_indicator'] = len(re.findall(r'C=O|C#N|NO2', smiles))
+        
+        # 自由体积相关特征
+        features['ffv_branching'] = len(re.findall(r'C\(C\)', smiles))
+        features['ffv_bulky_groups'] = len(re.findall(r'C\(C\)\(C\)', smiles))
+        
+        return features
+
+    def extract_fragment_features(self, smiles):
+        """提取官能团特征"""
+        features = {}
+        
+        # 扩展的官能团库
+        functional_groups = {
+            # 基本结构
+            'benzene_ring': r'c1ccccc1',
+            'phenyl': r'c1ccccc1',
+            'naphthalene': r'c1ccc2ccccc2c1',
+            
+            # 含氧官能团
+            'carbonyl': r'C=O',
+            'carboxyl': r'C\(=O\)O',
+            'ester': r'C\(=O\)O[^H]',
+            'ether': r'[^H]O[^H]',
+            'alcohol': r'[CH]O[H]?',
+            'aldehyde': r'C\(=O\)[H]',
+            'ketone': r'[^H]C\(=O\)[^H]',
+            
+            # 含氮官能团
+            'amine_primary': r'N[H][H]',
+            'amine_secondary': r'N[H][^H]',
+            'amine_tertiary': r'N\([^H]\)\([^H]\)',
+            'amide': r'C\(=O\)N',
+            'nitrile': r'C#N',
+            'nitro': r'N\(=O\)=O',
+            'imide': r'N\(C\(=O\)\)C\(=O\)',
+            
+            # 含硫官能团
+            'sulfone': r'S\(=O\)\(=O\)',
+            'sulfoxide': r'S\(=O\)',
+            'thiol': r'S[H]',
+            'thioether': r'[^H]S[^H]',
+            
+            # 卤代官能团
+            'fluoro': r'F',
+            'chloro': r'Cl',
+            'bromo': r'Br',
+            'iodo': r'I',
+            
+            # 聚合物相关
+            'methyl_branch': r'C\([H][H][H]\)',
+            'ethyl_branch': r'CC[H][H][H]',
+            'vinyl': r'C=C',
+            'allyl': r'C=CC',
+        }
+        
+        for group_name, pattern in functional_groups.items():
+            try:
+                matches = len(re.findall(pattern, smiles, re.IGNORECASE))
+                features[f'{group_name}_count'] = matches
+            except:
+                features[f'{group_name}_count'] = 0
+        
+        return features
+
+    def extract_sequence_features(self, smiles, max_length=200):
+        """提取序列特征"""
+        features = {}
+        
+        # 限制长度
+        smiles_truncated = smiles[:max_length]
+        
+        # 字符频率
+        char_counts = Counter(smiles_truncated)
+        total_chars = len(smiles_truncated)
+        
+        important_chars = ['C', 'c', 'N', 'n', 'O', 'o', 'S', 's', 'F', 'Cl', 'Br', 
+                          '=', '#', '(', ')', '[', ']', '1', '2', '3', '4', '5', '6']
+        
+        for char in important_chars:
+            features[f'char_freq_{char}'] = char_counts.get(char, 0) / max(total_chars, 1)
+        
+        # n-gram特征
+        # 2-gram
+        bigrams = [smiles_truncated[i:i+2] for i in range(len(smiles_truncated)-1)]
+        bigram_counts = Counter(bigrams)
+        
+        common_bigrams = ['CC', 'CO', 'CN', 'C=', 'c1', 'OC', 'NC', '(C', ')C', 'C(', 
+                         'cc', 'cC', 'Cc', '=O', '=C', 'C)', 'O)', 'N)']
+        for bigram in common_bigrams:
+            features[f'bigram_{bigram}'] = bigram_counts.get(bigram, 0) / max(len(bigrams), 1)
+        
+        # 3-gram
+        trigrams = [smiles_truncated[i:i+3] for i in range(len(smiles_truncated)-2)]
+        trigram_counts = Counter(trigrams)
+        
+        common_trigrams = ['CCC', 'C=O', 'COC', 'c1c', 'ccc', 'C(C', 'C)C', '=CC', 'CC=']
+        for trigram in common_trigrams:
+            features[f'trigram_{trigram}'] = trigram_counts.get(trigram, 0) / max(len(trigrams), 1)
+        
+        return features
+
+    def fit_tfidf_vectorizers(self, smiles_list, max_features=500):
+        """拟合TF-IDF向量化器"""
+        # 字符级别的TF-IDF
+        self.char_vectorizer = TfidfVectorizer(
+            analyzer='char',
+            ngram_range=(1, 4),
+            max_features=max_features//2,
+            min_df=2
+        )
+        
+        # 处理SMILES为"词汇"级别的TF-IDF
+        processed_smiles = []
+        for smiles in smiles_list:
+            # 将SMILES分割为"词汇"
+            tokens = re.findall(r'[A-Z][a-z]?|[0-9]|[=\#\(\)\[\]\-\+]', smiles)
+            processed_smiles.append(' '.join(tokens))
+        
+        self.token_vectorizer = TfidfVectorizer(
+            max_features=max_features//2,
+            min_df=2
+        )
+        
+        try:
+            self.char_vectorizer.fit(smiles_list)
+            self.token_vectorizer.fit(processed_smiles)
+            self.is_fitted = True
+        except Exception as e:
+            print(f"TF-IDF拟合失败: {e}")
+            self.is_fitted = False
+
+    def extract_tfidf_features(self, smiles_list):
+        """提取TF-IDF特征"""
+        if not self.is_fitted:
+            print("TF-IDF向量化器未拟合，返回零特征")
+            return np.zeros((len(smiles_list), 500)), [f'tfidf_{i}' for i in range(500)]
+        
+        # 处理SMILES为"词汇"级别
+        processed_smiles = []
+        for smiles in smiles_list:
+            tokens = re.findall(r'[A-Z][a-z]?|[0-9]|[=\#\(\)\[\]\-\+]', smiles)
+            processed_smiles.append(' '.join(tokens))
+        
+        try:
+            char_features = self.char_vectorizer.transform(smiles_list).toarray()
+            token_features = self.token_vectorizer.transform(processed_smiles).toarray()
+            
+            combined_features = np.hstack([char_features, token_features])
+            
+            # 创建特征名称
+            char_names = [f'tfidf_char_{i}' for i in range(char_features.shape[1])]
+            token_names = [f'tfidf_token_{i}' for i in range(token_features.shape[1])]
+            feature_names = char_names + token_names
+            
+            return combined_features, feature_names
+        except Exception as e:
+            print(f"TF-IDF转换失败: {e}")
+            # 如果TF-IDF失败，返回零矩阵
+            return np.zeros((len(smiles_list), 500)), [f'tfidf_{i}' for i in range(500)]
+
+    def estimate_carbon_chain_length(self, smiles):
+        """估算碳链长度"""
+        # 简单的碳链长度估算
+        carbon_count = smiles.count('C') + smiles.count('c')
+        # 考虑分支的影响
+        branch_penalty = smiles.count('(') * 0.5
+        return max(carbon_count - branch_penalty, 1)
+
+    def extract_all_features(self, smiles_list, fit_tfidf=False):
+        """提取所有特征"""
+        all_features = []
+        
+        # 如果需要拟合TF-IDF
+        if fit_tfidf and not self.is_fitted:
+            print("拟合TF-IDF向量化器...")
+            self.fit_tfidf_vectorizers(smiles_list)
+        
+        print("提取基本特征...")
+        for smiles in tqdm(smiles_list, desc="基本特征"):
+            try:
+                # 基本特征
+                basic_features = self.extract_basic_features(smiles)
+                
+                # 聚合物特异性特征
+                polymer_features = self.extract_polymer_specific_features(smiles)
+                
+                # 片段特征
+                fragment_features = self.extract_fragment_features(smiles)
+                
+                # 序列特征
+                sequence_features = self.extract_sequence_features(smiles)
+                
+                # 合并所有特征
+                combined_features = {**basic_features, **polymer_features, 
+                                   **fragment_features, **sequence_features}
+                all_features.append(combined_features)
+                
+            except Exception as e:
+                print(f"处理SMILES {smiles} 时出错: {e}")
+                all_features.append({})
+        
+        # 转换为DataFrame
+        features_df = pd.DataFrame(all_features)
+        features_df = features_df.fillna(0)
+        
+        # 提取TF-IDF特征
+        print("提取TF-IDF特征...")
+        tfidf_features, tfidf_names = self.extract_tfidf_features(smiles_list)
+        tfidf_df = pd.DataFrame(tfidf_features, columns=tfidf_names)
+        
+        # 合并所有特征
+        final_features = pd.concat([features_df, tfidf_df], axis=1)
+        
+        # 移除常数列和高度相关的列（仅在训练时）
+        if fit_tfidf:
+            print("特征后处理...")
+            variance = final_features.var()
+            constant_columns = variance[variance <= 1e-8].index
+            final_features = final_features.drop(columns=constant_columns)
+            
+            # 移除高度相关的特征
+            corr_matrix = final_features.corr().abs()
+            upper_triangle = corr_matrix.where(
+                np.triu(np.ones(corr_matrix.shape), k=1).astype(bool)
+            )
+            
+            high_corr_features = [column for column in upper_triangle.columns 
+                                 if any(upper_triangle[column] > 0.95)]
+            final_features = final_features.drop(columns=high_corr_features)
+            
+            # 保存特征名称用于测试时对齐
+            self.final_feature_names = final_features.columns.tolist()
+        else:
+            # 测试时，确保特征与训练时对齐
+            if hasattr(self, 'final_feature_names'):
+                # 添加缺失的特征（用0填充）
+                for col in self.final_feature_names:
+                    if col not in final_features.columns:
+                        final_features[col] = 0
+                
+                # 移除多余的特征并重新排序
+                final_features = final_features[self.final_feature_names]
+        
+        print(f"最终特征数量: {final_features.shape[1]}")
+        
+        return final_features
+
+class AdvancedPolymerPredictor:
+    """高级聚合物性能预测器"""
+    
+    def __init__(self):
+        self.feature_extractor = AdvancedSMILESFeatureExtractor()
+        self.scalers = {}
+        self.models = {}
+        self.feature_selectors = {}
+        self.target_names = ['Tg', 'FFV', 'Tc', 'Density', 'Rg']
+        
+        # 物理约束
+        self.property_constraints = {
+            'Tg': (150, 600),      # 玻璃化转变温度 (K)
+            'FFV': (0.01, 0.5),    # 分数自由体积
+            'Tc': (0.1, 5.0),      # 热导率 (W/m·K)
+            'Density': (0.8, 2.5), # 密度 (g/cm³)
+            'Rg': (1.0, 100.0)     # 回转半径 (Å)
+        }
+
+    def create_stacked_ensemble(self, X_train, y_train, target_idx):
+        """创建堆叠集成模型"""
+        # 基础模型
+        base_models = [
+            ('rf', RandomForestRegressor(n_estimators=300, max_depth=15, 
+                                       min_samples_split=5, random_state=42, n_jobs=-1)),
+            ('et', ExtraTreesRegressor(n_estimators=300, max_depth=15, 
+                                     min_samples_split=5, random_state=42, n_jobs=-1)),
+            ('gbr', GradientBoostingRegressor(n_estimators=200, max_depth=8, 
+                                            learning_rate=0.1, random_state=42)),
+            ('ridge', Ridge(alpha=10.0)),
+            ('elastic', ElasticNet(alpha=0.1, l1_ratio=0.5))
+        ]
+        
+        # 生成堆叠特征
+        stacked_features = []
+        trained_models = []
+        
+        for name, model in base_models:
+            try:
+                # 使用交叉验证生成堆叠特征
+                cv_pred = cross_val_predict(model, X_train, y_train, cv=5)
+                stacked_features.append(cv_pred.reshape(-1, 1))
+                
+                # 训练模型
+                model.fit(X_train, y_train)
+                trained_models.append((name, model))
+            except Exception as e:
+                print(f"  基础模型 {name} 训练失败: {e}")
+        
+        if not stacked_features:
+            return None
+        
+        # 合并堆叠特征
+        X_stacked = np.hstack(stacked_features)
+        
+        # 元学习器
+        meta_model = Ridge(alpha=1.0)
+        meta_model.fit(X_stacked, y_train)
+        
+        return {
+            'base_models': trained_models,
+            'meta_model': meta_model
+        }
+
+    def train_property_specific_models(self, X_train, y_train, X_val=None, y_val=None):
+        """训练属性特异性模型"""
+        models = {}
+        
+        for i, target in enumerate(self.target_names):
+            print(f"训练 {target} 模型...")
+            
+            # 获取有效数据
+            mask = ~np.isnan(y_train[:, i])
+            if mask.sum() == 0:
+                print(f"  {target} 没有有效数据，跳过")
+                continue
+            
+            X_target = X_train[mask]
+            y_target = y_train[mask, i]
+            
+            # 特征选择
+            try:
+                selector = SelectKBest(score_func=f_regression, k=min(500, X_target.shape[1]))
+                X_target_selected = selector.fit_transform(X_target, y_target)
+                self.feature_selectors[target] = selector
+                print(f"  选择了 {X_target_selected.shape[1]} 个特征")
+            except:
+                X_target_selected = X_target
+                self.feature_selectors[target] = None
+            
+            # 创建堆叠集成模型
+            stacked_model = self.create_stacked_ensemble(X_target_selected, y_target, i)
+            
+            if stacked_model:
+                models[target] = stacked_model
+                
+                # 验证性能
+                if X_val is not None and y_val is not None:
+                    val_mask = ~np.isnan(y_val[:, i])
+                    if val_mask.sum() > 0:
+                        val_pred = self.predict_single_property(
+                            X_val[val_mask], target, models[target]
+                        )
+                        val_score = mean_absolute_error(y_val[val_mask, i], val_pred)
+                        print(f"  验证MAE: {val_score:.4f}")
+            else:
+                print(f"  {target} 堆叠模型创建失败")
+        
+        return models
+
+    def predict_single_property(self, X_test, target, model_dict):
+        """预测单个属性"""
+        try:
+            # 特征选择
+            if self.feature_selectors.get(target):
+                X_test_selected = self.feature_selectors[target].transform(X_test)
+            else:
+                X_test_selected = X_test
+            
+            # 基础模型预测
+            base_predictions = []
+            for name, model in model_dict['base_models']:
+                pred = model.predict(X_test_selected)
+                base_predictions.append(pred.reshape(-1, 1))
+            
+            if not base_predictions:
+                return np.zeros(len(X_test))
+            
+            # 元模型预测
+            X_meta = np.hstack(base_predictions)
+            final_pred = model_dict['meta_model'].predict(X_meta)
+            
+            return final_pred
+            
+        except Exception as e:
+            print(f"预测 {target} 时出错: {e}")
+            return np.zeros(len(X_test))
+
+    def apply_constraints(self, predictions):
+        """应用物理约束"""
+        constrained_pred = predictions.copy()
+        
+        for i, target in enumerate(self.target_names):
+            if target in self.property_constraints:
+                min_val, max_val = self.property_constraints[target]
+                constrained_pred[:, i] = np.clip(constrained_pred[:, i], min_val, max_val)
+        
+        return constrained_pred
+
+    def fit(self, smiles_train, y_train, smiles_val=None, y_val=None):
+        """训练预测器"""
+        print("提取训练特征...")
+        X_train = self.feature_extractor.extract_all_features(smiles_train, fit_tfidf=True)
+        
+        if smiles_val is not None:
+            print("提取验证特征...")
+            X_val = self.feature_extractor.extract_all_features(smiles_val, fit_tfidf=False)
+        else:
+            X_val = None
+        
+        # 特征标准化
+        self.scaler = RobustScaler()
+        X_train_scaled = self.scaler.fit_transform(X_train)
+        
+        if X_val is not None:
+            X_val_scaled = self.scaler.transform(X_val)
+        else:
+            X_val_scaled = None
+        
+        # 训练模型
+        self.models = self.train_property_specific_models(
+            X_train_scaled, y_train, X_val_scaled, y_val
+        )
+        
+        print("模型训练完成!")
+
+    def predict(self, smiles_test):
+        """预测"""
+        print("提取测试特征...")
+        X_test = self.feature_extractor.extract_all_features(smiles_test, fit_tfidf=False)
+        X_test_scaled = self.scaler.transform(X_test)
+        
+        # 预测结果
+        predictions = np.zeros((len(smiles_test), len(self.target_names)))
+        
+        for i, target in enumerate(self.target_names):
+            if target in self.models:
+                predictions[:, i] = self.predict_single_property(
+                    X_test_scaled, target, self.models[target]
+                )
+        
+        # 应用物理约束
+        predictions = self.apply_constraints(predictions)
+        
+        return predictions
+
+    def weighted_mae_score(self, y_true, y_pred):
+        """计算加权MAE"""
+        if len(y_true.shape) == 1:
+            return mean_absolute_error(y_true, y_pred)
+        
+        maes = []
+        for i in range(y_true.shape[1]):
+            mask = ~np.isnan(y_true[:, i])
+            if mask.sum() > 0:
+                mae = mean_absolute_error(y_true[mask, i], y_pred[mask, i])
+                maes.append(mae)
+        return np.mean(maes) if maes else 0
+
+def main():
+    print("读取数据...")
+    try:
+        train_df = pd.read_csv('/kaggle/input/neurips-open-polymer-prediction-2025/train.csv')
+        test_df = pd.read_csv('/kaggle/input/neurips-open-polymer-prediction-2025/test.csv')
+    except FileNotFoundError:
+        print("文件未找到，请确保数据文件存在")
+        return
+    
+    print(f"训练集大小: {len(train_df)}")
+    print(f"测试集大小: {len(test_df)}")
+    
+    # 目标变量
+    target_cols = ['Tg', 'FFV', 'Tc', 'Density', 'Rg']
+    
+    # 数据分析
+    print("\n目标变量统计:")
+    for col in target_cols:
+        if col in train_df.columns:
+            non_null_count = train_df[col].count()
+            print(f"{col}: {non_null_count} 个非空值 ({non_null_count/len(train_df)*100:.1f}%)")
+    
+    # 准备数据
+    smiles_train = train_df['SMILES'].tolist()
+    y_train = train_df[target_cols].values
+    smiles_test = test_df['SMILES'].tolist()
+    
+    # 训练/验证分割
+    smiles_train_split, smiles_val_split, y_train_split, y_val_split = train_test_split(
+        smiles_train, y_train, test_size=0.2, random_state=42
+    )
+    
+    # 创建预测器
+    predictor = AdvancedPolymerPredictor()
+    
+    # 训练模型
+    print("\n开始训练...")
+    predictor.fit(smiles_train_split, y_train_split, smiles_val_split, y_val_split)
+    
+    # 验证性能
+    print("验证模型...")
+    val_predictions = predictor.predict(smiles_val_split)
+    val_score = predictor.weighted_mae_score(y_val_split, val_predictions)
+    print(f"验证集加权MAE: {val_score:.4f}")
+    
+    # 在完整数据上重新训练
+    print("\n在完整训练集上重新训练...")
+    final_predictor = AdvancedPolymerPredictor()
+    final_predictor.fit(smiles_train, y_train)
+    
+    # 预测测试集
+    print("预测测试集...")
+    test_predictions = final_predictor.predict(smiles_test)
+    
+    # 创建提交文件
+    print("创建提交文件...")
+    submission = pd.DataFrame()
+    submission['id'] = test_df['id']
+    for i, col in enumerate(target_cols):
+        submission[col] = test_predictions[:, i]
+    
+    submission.to_csv('submission.csv', index=False)
+    print("预测完成！结果保存到 submission.csv")
+    
+    # 预测统计
+    print("\n预测统计:")
+    for i, col in enumerate(target_cols):
+        pred_values = test_predictions[:, i]
+        print(f"{col}: 均值={pred_values.mean():.4f}, 标准差={pred_values.std():.4f}")
+        print(f"     范围=[{pred_values.min():.4f}, {pred_values.max():.4f}]")
+    
+    # 保存模型
+    try:
+        joblib.dump(final_predictor, 'polymer_predictor_model.pkl')
+        print("\n模型已保存到 polymer_predictor_model.pkl")
+    except:
+        print("\n模型保存失败")
+    
+    # 显示submission.csv的前几行
+    print("\nSubmission.csv 前5行预览:")
+    print(submission.head())
+    
+    # 检查是否有异常值
+    print("\n检查异常值:")
+    for i, col in enumerate(target_cols):
+        min_constraint, max_constraint = final_predictor.property_constraints[col]
+        pred_values = test_predictions[:, i]
+        
+        min_violations = (pred_values < min_constraint).sum()
+        max_violations = (pred_values > max_constraint).sum()
+        
+        if min_violations > 0 or max_violations > 0:
+            print(f"{col}: {min_violations} 个值被约束到最小值, {max_violations} 个值被约束到最大值")
+        else:
+            print(f"{col}: 所有预测值在合理范围内")
+
+if __name__ == "__main__":
+    main()
